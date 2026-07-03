@@ -1,0 +1,283 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torchvision
+import torchvision.transforms as transforms
+
+import matplotlib.pyplot as plt
+import numpy as np
+
+from torch.utils.data import DataLoader
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+batch_size = 128
+latent_dim = 100
+epochs = 100
+lr = 0.0002
+
+print(device)
+
+transformacao = transforms.Compose([
+    transforms.ToTensor(),
+    transforms.Normalize((0.5,), (0.5,))
+])
+
+base_dados = torchvision.datasets.MNIST(
+    root="./data",
+    train=True,
+    transform=transformacao,
+    download=True
+)
+
+loader = DataLoader(
+    base_dados,
+    batch_size=batch_size,
+    shuffle=True
+)
+
+def inicializa_pesos(m):
+    nome_classe = m.__class__.__name__
+    if nome_classe.find("Conv") != -1:
+        nn.init.normal_(m.weight.data, 0.0, 0.02)
+    elif nome_classe.find("BatchNorm") != -1:
+        nn.init.normal_(m.weight.data, 1.0, 0.02)
+        nn.init.constant_(m.bias.data, 0)
+
+class Gerador(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.principal = nn.Sequential(
+            nn.ConvTranspose2d(
+                latent_dim,
+                256,
+                7,
+                1,
+                0,
+                bias=False
+            ),
+            nn.BatchNorm2d(256),
+            nn.ReLU(True),
+            nn.ConvTranspose2d(
+                256,
+                128,
+                4,
+                2,
+                1,
+                bias=False
+            ),
+            nn.BatchNorm2d(128),
+            nn.ReLU(True),
+            nn.ConvTranspose2d(
+                128,
+                64,
+                4,
+                2,
+                1,
+                bias=False
+            ),
+            nn.BatchNorm2d(64),
+            nn.ReLU(True),
+            nn.Conv2d(
+                64,
+                1,
+                3,
+                1,
+                2,
+                bias=False
+            ),
+            nn.Tanh()
+        )
+
+    def forward(self, x):
+        return self.principal(x)[:, :, :28, :28]
+
+class Discriminador(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.principal = nn.Sequential(
+            nn.Conv2d(
+                1,
+                64,
+                4,
+                2,
+                1
+            ),
+            nn.LeakyReLU(
+                0.2,
+                inplace=True
+            ),
+            nn.Conv2d(
+                64,
+                128,
+                4,
+                2,
+                1
+            ),
+            nn.BatchNorm2d(128),
+            nn.LeakyReLU(
+                0.2,
+                inplace=True
+            ),
+            nn.Conv2d(
+                128,
+                256,
+                3,
+                2,
+                1
+            ),
+            nn.BatchNorm2d(256),
+            nn.LeakyReLU(
+                0.2,
+                inplace=True
+            ),
+            nn.Flatten(),
+            nn.Linear(
+                4096,
+                1
+            ),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        return self.principal(x)
+
+G = Gerador().to(device)
+D = Discriminador().to(device)
+
+G.apply(inicializa_pesos)
+D.apply(inicializa_pesos)
+
+criterio = nn.BCELoss()
+
+otimizador_G = optim.Adam(
+    G.parameters(),
+    lr=lr,
+    betas=(0.5, 0.999)
+)
+
+otimizador_D = optim.Adam(
+    D.parameters(),
+    lr=lr,
+    betas=(0.5, 0.999)
+)
+
+ruido_fixo = torch.randn(
+    25,
+    latent_dim,
+    1,
+    1,
+    device=device
+)
+
+epocas_para_salvar = [1, 5, 20, 50, 100]
+imagens_salvas = {}
+
+historico_loss_G = []
+historico_loss_D = []
+
+for epoca in range(1, epochs + 1):
+    for imagens_reais, _ in loader:
+        imagens_reais = imagens_reais.to(device)
+        tamanho_lote = imagens_reais.size(0)
+
+        rotulos_reais = torch.full(
+            (tamanho_lote, 1),
+            0.9,
+            device=device
+        )
+        rotulos_falsos = torch.zeros(
+            tamanho_lote,
+            1,
+            device=device
+        )
+
+        ##################################################
+        # Treina D
+        ##################################################
+        D.zero_grad()
+
+        saida_real = D(imagens_reais)
+        loss_real = criterio(saida_real, rotulos_reais)
+
+        ruido = torch.randn(
+            tamanho_lote,
+            latent_dim,
+            1,
+            1,
+            device=device
+        )
+        imagens_falsas = G(ruido)
+
+        saida_falsa = D(imagens_falsas.detach())
+        loss_falsa = criterio(saida_falsa, rotulos_falsos)
+
+        loss_D = loss_real + loss_falsa
+        loss_D.backward()
+        otimizador_D.step()
+
+        ##################################################
+        # Treina G
+        ##################################################
+        G.zero_grad()
+
+        saida = D(imagens_falsas)
+        loss_G = criterio(saida, rotulos_reais)
+        loss_G.backward()
+        otimizador_G.step()
+
+    historico_loss_G.append(loss_G.item())
+    historico_loss_D.append(loss_D.item())
+
+    print(
+        f"Epoch {epoca:03d} | "
+        f"D: {loss_D.item():.4f} | "
+        f"G: {loss_G.item():.4f}"
+    )
+
+    if epoca in epocas_para_salvar:
+        with torch.no_grad():
+            saidas_geradas = G(ruido_fixo).detach().cpu()
+            imagens_salvas[epoca] = saidas_geradas
+
+##################################################
+# Plotar os Graficos
+##################################################
+
+plt.figure(figsize=(10,5))
+plt.plot(historico_loss_G, label="Generator")
+plt.plot(historico_loss_D, label="Discriminator")
+plt.xlabel("Epoch")
+plt.ylabel("Loss")
+plt.legend()
+plt.grid()
+plt.savefig("curva_perdas.png", dpi=150, bbox_inches="tight")
+plt.show()
+
+fig, axes = plt.subplots(
+    len(epocas_para_salvar),
+    5,
+    figsize=(8, 10)
+)
+
+##################################################
+# Salvar as Imagens
+##################################################
+
+for row, epoch in enumerate(epocas_para_salvar):
+    imgs = imagens_salvas[epoch]
+    for col in range(5):
+        img = imgs[col].squeeze()
+        axes[row, col].imshow(
+            img,
+            cmap="gray"
+        )
+        axes[row, col].axis("off")
+        if col == 0:
+            axes[row, col].set_title(
+                f"Epoch {epoch}"
+            )
+
+plt.tight_layout()
+fig.savefig("grade_resultados.png", dpi=150, bbox_inches="tight")
+plt.show()
